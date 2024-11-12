@@ -5,7 +5,7 @@ from .prompts import create_answering_conversation_messages, create_extraction_c
 # COUNTING
 
 # properties of the model used
-model_type='gpt-3.5-turbo'
+model_type='gpt-4o-mini'
 model_token_limit=4096
 model_tokens_per_message = 4  # every message follows <|start|>{role/name}\n{content}<|end|>\n
 model_tokens_per_name = -1  # if there's a name, the role is omitted

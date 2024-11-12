@@ -1,4 +1,8 @@
 import os
+import logging
+
+logging.basicConfig(filename='agent.log', level=logging.INFO)
+
 
 def load_markdown_files_from_directory(directory):
     """
@@ -94,6 +98,7 @@ def split_markdown(text):
     Returns:
         list of tuples: A list of tuples containing the section title (str) and section content (str).
     """
+    logging.info("inizio ciclo split")
     lines = text.split('\n')
 
     # Remove the title heading (if present) from the text
@@ -136,5 +141,44 @@ def split_markdown(text):
     if len(current_section) > 0:
         current_section_body = '\n'.join(current_section)
         sections.append((current_section_title, current_section_body))
-
+    logging.info("fine ciclo split")
     return sections
+
+
+def load_markdown_files_from_db(agent_stream_id,db_manager):
+    """
+    Carica i dati markdown dal database PostgreSQL.
+    
+    Args:
+        db_config (dict): Un dizionario con i dettagli di connessione per il database PostgreSQL.
+                          Deve contenere chiavi come 'dbname', 'user', 'password', 'host', e 'port'.
+
+    Returns:
+        list of tuples: Una lista di tuple contenente l'URL (str) e il contenuto markdown (str) per ogni riga della tabella.
+    """
+    markdown_files_data = []
+
+
+    #try:
+        # Cursore per eseguire le query
+        # Query per ottenere url e markdown_content dalla tabella scraped_pages
+    query = f"""
+        SELECT id, url, markdown_content
+        FROM scraped_pages
+        WHERE markdown_content IS NOT NULL 
+        and agent_stream_id = {agent_stream_id}
+        and run_id = (select MAX(run_id) from scraped_pages where  agent_stream_id = {agent_stream_id});
+    """
+    rows = db_manager.fetch(query)
+    
+    # Aggiungi ogni riga ai dati markdown
+    for row in rows:
+        id, url, markdown_content = row
+        markdown_files_data.append((id, url, markdown_content))
+    
+    """ except Exception as e:
+        print(f"Errore durante il caricamento dei dati dal database: {e}") """
+
+
+    return markdown_files_data
+

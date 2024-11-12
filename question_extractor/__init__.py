@@ -2,29 +2,41 @@ import re
 import os
 import asyncio
 import openai
+import json
+from pathlib import Path
+import logging
+
 from tenacity import (
     retry,
     wait_random_exponential,
 )  
-import openai.error
+from openai import OpenAIError
 from aiolimiter import AsyncLimiter
 from langchain.chat_models import ChatOpenAI
 from contextlib import asynccontextmanager
-from .markdown import load_markdown_files_from_directory, split_markdown
+from .markdown import load_markdown_files_from_db,load_markdown_files_from_directory, split_markdown
 from .token_counting import count_tokens_text, count_tokens_messages, get_available_tokens, are_tokens_available_for_both_conversations
 from .prompts import create_answering_conversation_messages, create_extraction_conversation_messages
+from service.AgentConfigManager import AgentConfigManager
+from service.TrackedChatOpenAIWrapper import TrackedChatOpenAIWrapper
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(filename='agent.log', level=logging.INFO)
+db_manager = AgentConfigManager()
 
 # replace the "Key" with your own API key, you can provide multiply APIs in the list
-API_KEYS = ["Key1"，"Key2"]
 api_key_lock = asyncio.Lock()
 api_key_index = 0
 #---------------------------------------------------------------------------------------------
-# QUESTION PROCESSING
+# QUESTION PROCESSING 
 
 # Ensure we do not run too many concurent requests
 model_rate_limits = 2000
 max_concurent_request = int(model_rate_limits * 0.75)
 throttler = asyncio.Semaphore(max_concurent_request)
+import logging
 
 
 def flatten_nested_lists(nested_lists):
@@ -60,8 +72,8 @@ async def run_model(messages):
     """
     async with api_key_lock:  # Ensure that the rotation is thread-safe
         global api_key_index
-        os.environ['OPENAI_API_KEY'] = API_KEYS[api_key_index]
-        api_key_index = (api_key_index + 1) % len(API_KEYS)
+        #os.environ['OPENAI_API_KEY'] = API_KEYS[api_key_index]
+        #api_key_index = (api_key_index + 1) % len(API_KEYS)
     # Count the number of tokens in the input messages
     num_tokens_in_messages = count_tokens_messages(messages)
 
@@ -69,23 +81,28 @@ async def run_model(messages):
     num_tokens_available = get_available_tokens(num_tokens_in_messages)
 
     # Create an instance of the ChatOpenAI model with minimum imagination (temperature set to 0)
-    model = ChatOpenAI(temperature=0.0, max_tokens=num_tokens_available)
-
+    #model =  ChatOpenAI(model="gpt-4o-mini", temperature=0.0, max_tokens=num_tokens_available)
+    model = TrackedChatOpenAIWrapper(agent_id=9, model="gpt-4o-mini", temperature=0.0, max_tokens=num_tokens_available)
+ 
     try:
         # Use a semaphore to limit the number of simultaneous calls
         async with throttler:
-            # Asynchronously run the model on the input messages
-            output = await model._agenerate(messages)
+            try:
+                # Asynchronously run the model on the input messages
+                output = await model.call(messages) 
+            except Exception as e:
+                logging.exception(f"ERROR ({e}): Could not generate text for an input.")
+                return 'ERROR'
     except openai.error.RateLimitError as e:
-        print(f"ERROR ({e}): Rate limit exceeded, retrying.")
+        logging.info(f"ERROR ({e}): Rate limit exceeded, retrying.")
         raise  # Re-raise the exception to allow tenacity to handle the retry
     except openai.error.APIConnectionError as e:
-        print(f"ERROR ({e}): Could not connect, retrying.")
+        logging.info(f"ERROR ({e}): Could not connect, retrying.")
         raise  # Re-raise the exception to allow tenacity to handle the retry
     except Exception as e:
-        print(f"ERROR ({e}): Could not generate text for an input.")
+        logging.exception(f"ERROR ({e}): Could not generate text for an input.")
         return 'ERROR'
-    
+    logging.info("dovrebbe aver finito il run model")
     # Extract and return the generated text from the model output
     return output.generations[0].text.strip()
 
@@ -108,7 +125,7 @@ def extract_questions_from_output(output):
 
     # Check if the last question is incomplete (does not end with punctuation or a parenthesis)
     if (len(questions) > 0) and (not re.search(r"[.!?)]$", questions[-1].strip())):
-        print(f"WARNING: Popping incomplete question: '{questions[-1]}'")
+        logging.info(f"WARNING: Popping incomplete question: '{questions[-1]}'")
         questions.pop()
 
     return questions
@@ -126,13 +143,13 @@ async def extract_questions_from_text(file_path, text):
         list of tuple: A list of tuples, each containing the file path, text, and extracted question.
     """
     # Ensure the text can be processed by the model
-    global api_key_index
+    #global api_key_index
     text = text.strip()
     num_tokens_text = count_tokens_text(text)
 
     if not are_tokens_available_for_both_conversations(num_tokens_text):
         # Split text and call function recursively
-        print(f"WARNING: Splitting '{file_path}' into smaller chunks.")
+        logging.info(f"WARNING: Splitting '{file_path}' into smaller chunks.")
 
         # Build tasks for each subsection of the text
         tasks = []
@@ -143,6 +160,7 @@ async def extract_questions_from_text(file_path, text):
 
         # Asynchronously run tasks and gather outputs
         tasks_outputs = await asyncio.gather(*tasks)
+        logging.info("arrivo alla fine della estrazione delle domande dal testo")
 
         # Flatten and return the results
         return flatten_nested_lists(tasks_outputs)
@@ -151,7 +169,7 @@ async def extract_questions_from_text(file_path, text):
         messages = create_extraction_conversation_messages(text)
         output = await run_model(messages)
         questions = extract_questions_from_output(output)
-
+        logging.info("estraggo questions")
         # Associate questions with source information and return as a list of tuples
         outputs = [(file_path, text, question.strip()) for question in questions]
         return outputs
@@ -171,76 +189,99 @@ async def generate_answer(question, source):
     # Create the input messages for the chat model
     messages = create_answering_conversation_messages(question, source)
     # Asynchronously run the chat model with the input messages
+    logging.info(f"run model di generate_answer")
     answer = await run_model(messages)
-
+    logging.info(f"finita run model di generate_answer")
     return answer
 
 #---------------------------------------------------------------------------------------------
 # FILE PROCESSING
 
-async def process_file(file_path, text, progress_counter, verbose=True,max_qa_pairs=300):
+async def process_file(page_id, file_path, text, progress_counter, db_manager, verbose=True, max_qa_pairs=300):
     """
-    Asynchronously processes a file, extracting questions and generating answers concurrently.
+    Asynchronously processes a file, extracting questions and generating answers concurrently,
+    checking and saving results to the database.
     
     Args:
+        page_id (int): The ID of the page to process.
         file_path (str): The file path of the markdown file.
         text (str): The text content of the markdown file.
         progress_counter (dict): A dictionary containing progress information ('nb_files_done' and 'nb_files').
-        verbose (bool): If True, print progress information. Default is True.
+        db_manager (DBManager): A database manager instance to interact with the database.
+        verbose (bool): If True, logging.info progress information. Default is True.
+        max_qa_pairs (int): Maximum number of question-answer pairs to process.
 
     Returns:
         list: A list of dictionaries containing source, question, and answer information.
     """
-    questions_file_name = f"{file_path}.json"
-    if Path(questions_file_name).is_file():
-        with open(questions_file_name, 'r') as input_file:
-            questions = json.loads(input_file.read())
-    else:
-        # Extract questions from the text
-        questions = await extract_questions_from_text(file_path, text)
+    # Step 1: Check if questions and answers for the page_id already exist in the database
+    query = "SELECT scraped_page_id, path, question, answer FROM qa_blocks WHERE scraped_page_id = %s"
+    existing_records =  db_manager.fetch(query, (page_id,))
 
-        # Limit the number of questions processed
-        questions = questions[:max_qa_pairs]
+    # If records exist, return them
+    if existing_records:
+        logging.info("Records already exist in the database.")
+        #return existing_records 
+    
+    # Step 2: Extract questions from the text if not found in the database
+    questions = await extract_questions_from_text(file_path, text)
+    questions = questions[:max_qa_pairs]  # Limit to max_qa_pairs if needed
 
-        with open(questions_file_name, 'w') as output_file:
-            json.dump(questions, output_file, indent=2)
+    logging.info("genero risposte e domande.")
+    # Step 3: Generate answers asynchronously
+    tasks = [generate_answer(question, text) for _, text, question in questions]
+    tasks_outputs = await asyncio.gather(*tasks)
 
-    results_filename = f"{file_path}.result.json"
+    # Step 4: Prepare the results and save them in the database
     result = []
-    if Path(results_filename).is_file():
-        with open(results_filename, 'r') as input_file2:
-            result = json.loads(input_file2.read())
-    else:
-        # Build and run answering tasks concurrently
-        tasks = []
-        for sub_file_path, sub_text, question in questions:
-            task = generate_answer(question, sub_text)
-            tasks.append(task)
+    for (sub_file_path, sub_text, question), answer in zip(questions, tasks_outputs):
+        logging.info(f" answer: {answer}, question: {question}")
+           
+        result_entry = {'page_id': page_id, 'source': sub_file_path, 'question': question, 'answer': answer}
+        result.append(result_entry)
+        """ try:
+            insert_qa_block(db_manager,page_id,sub_file_path,question,answer)
+        except Exception as e:
+            logging.info(f"errore in qa_block: {str(e)}") """
+        logging.info(f"faccio question")
 
-        tasks_outputs = await asyncio.gather(*tasks)
+        
+        # Insert each Q&A pair into the database
+        #insert_query = """
+        #INSERT INTO qa_blocks (scraped_page_id, source, question, answer)
+        #VALUES (%s, %s, %s, %s)
+        #"""
+        #await db_manager.execute(insert_query, (page_id, sub_file_path, question, answer))
 
-        # Merge results into a list of dictionaries
-        for (sub_file_path, sub_text, question), answer in zip(questions, tasks_outputs):
-            result.append({'source': sub_file_path, 'question': question, 'answer': answer})
-
-        with open(results_filename, 'w') as output_file:
-            json.dump(result, output_file, indent=2)
-
-    # Update progress and display information if verbose is True
-    progress_counter['nb_files_done'] += 1  # No race condition as we are single-threaded
+    # Step 5: Update progress and logging.info information if verbose is True
+    progress_counter['nb_files_done'] += 1
     if verbose:
-        print(f"{progress_counter['nb_files_done']}/{progress_counter['nb_files']}: File '{file_path}' done!")
+        logging.info(f"{progress_counter['nb_files_done']}/{progress_counter['nb_files']}: File '{file_path}' processed!")
 
+    logging.info(f"\n result di process_file: \n {result}")
     return result
 
+def insert_qa_block(db_manager, page_id, sub_file_path, question, answer):
+    """
+    Inserisce un blocco QA nella tabella `qa_blocks`.
+    """
+    query = """
+    INSERT INTO qa_blocks (scraped_page_id, path, question, answer, created_at, updated_at)
+    VALUES (%s, %s, %s, %s, now()::timestamp(0), now()::timestamp(0))
+    """
+    
+    params = (page_id, sub_file_path, question, answer)
+    
+    # Esegui l'inserimento utilizzando db_manager
+    db_manager.execute(query, params)
 
-async def process_files(files, verbose=True):
+async def process_files(files, db_manager, verbose=True):
     """
     Asynchronously processes a list of files, extracting questions and generating answers concurrently.
     
     Args:
         files (list): A list of tuples containing file paths and their respective text content.
-        verbose (bool): If True, print progress information. Default is True.
+        verbose (bool): If True, logging.info progress information. Default is True.
 
     Returns:
         list: A merged list of dictionaries containing source, question, and answer information.
@@ -248,12 +289,14 @@ async def process_files(files, verbose=True):
     # Set up progress information for display
     nb_files = len(files)
     progress_counter = {'nb_files': nb_files, 'nb_files_done': 0}
-    if verbose: print(f"Starting question extraction on {nb_files} files.")
+    if verbose: logging.info(f"Starting question extraction on {nb_files} files.")
 
     # Build and run tasks for each file concurrently
     tasks = []
-    for file_path, text in files:
-        task = process_file(file_path, text, progress_counter, verbose=verbose)
+    #logging.info("file zero:")
+    #logging.info(files[0])
+    for id, file_path, text in files:
+        task = process_file(id, file_path, text, progress_counter,db_manager, verbose=verbose)
         tasks.append(task)
 
     tasks_outputs = await asyncio.gather(*tasks)
@@ -264,24 +307,35 @@ async def process_files(files, verbose=True):
 #---------------------------------------------------------------------------------------------
 # MAIN
 
-def extract_questions_from_directory(input_folder, verbose=True):
+async def extract_questions_from_db(agent_stream_id, db_manager=None,verbose=True):
     """
-    Extracts questions and answers from all markdown files in the input folder.
+    Extracts questions and answers from all markdown files from db.
 
     Args:
-        input_folder (str): A path to a folder containing markdown files.
-        verbose (bool): If True, print progress information. Default is True.
+        agent_stream_id (str): Agent id.
+        db_manager(Object): Class db_manager
+        verbose (bool): If True, logging.info progress information. Default is True.
 
     Returns:
         list: A list of dictionaries containing path, source, question, and answer information.
     """
     # Load input files from the folder
-    if verbose: print(f"Loading files from '{input_folder}'.")
-    files = load_markdown_files_from_directory(input_folder)
+    if verbose: logging.info(f"Loading files from '{agent_stream_id}'.")
+    logging.info("carico i file dal db")
+    files = load_markdown_files_from_db(agent_stream_id, db_manager)
+   
 
+    #logging.info(files)
     # Run question extraction tasks
-    loop = asyncio.get_event_loop()
-    results = loop.run_until_complete(process_files(files, verbose=verbose))
+   # loop = asyncio.get_event_loop()
+    #if loop:
+    #    results = loop.run_until_complete(process_files(files, verbose=verbose))
+    #else:
+    logging.info("processo i files")
 
-    if verbose: print(f"Done, {len(results)} question/answer pairs have been generated!")
+    results = await process_files(files,db_manager, verbose=verbose)
+    logging.info(f"\n risultato di process_files: \n {results}")
+
+
+    if verbose: logging.info(f"Done, {len(results)} question/answer pairs have been generated!")
     return results

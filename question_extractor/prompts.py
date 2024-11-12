@@ -4,7 +4,7 @@ from langchain.schema import HumanMessage, SystemMessage
 # EXTRACTION
 
 # prompt used to extract questions
-extraction_system_prompt="You are an expert user extracting information to quiz people on documentation. You will be passed a page extracted from the documentation, write a numbered list of questions that can be answered based *solely* on the given text."
+extraction_system_prompt="Sei un utente esperto che estrae informazioni per interrogare le persone sulla documentazione. Ti verrà passata una pagina estratta dalla documentazione, scrivi un elenco numerato di domande a cui si può rispondere basandosi *solamente* sul testo fornito."
 
 def create_extraction_conversation_messages(text):
     """
@@ -30,7 +30,7 @@ def create_extraction_conversation_messages(text):
 # ANSWERING
 
 # prompt used to answer a question
-answering_system_prompt="You are an expert user answering questions. You will be passed a page extracted from a documentation and a question. Generate a comprehensive and informative answer to the question based *solely* on the given text."
+answering_system_prompt="Sei un utente esperto che risponde a domande. Ti verrà passata una pagina estratta da una documentazione e una domanda. Genera una risposta completa e informativa alla domanda basata *solamente* sul testo fornito."
 
 
 def create_answering_conversation_messages(question, text):
